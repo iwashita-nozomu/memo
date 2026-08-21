@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.3.0";
 
 #[derive(Debug)]
 struct Config {
@@ -105,14 +105,30 @@ fn run() -> Result<(), String> {
         git_context.as_ref(),
         &message,
     );
+    let mirrors = tags
+        .iter()
+        .filter(|tag| tag.as_str() != "inbox")
+        .map(|tag| {
+            data_root
+                .join(tag)
+                .join(&environment)
+                .join(format!("{date}.md"))
+        })
+        .collect::<Vec<_>>();
+    let mut paths = vec![source.clone()];
+    paths.extend(mirrors.iter().cloned());
     {
         let _lock = acquire_sync_lock(&config.repo)?;
+        register_tags(&tags)?;
         append_entry(&source, &content)?;
+        for mirror in &mirrors {
+            append_entry(mirror, &content)?;
+        }
     }
 
     println!("saved: {}", source.display());
     if config.auto_sync {
-        spawn_sync_worker(&config, std::slice::from_ref(&source), &message)?;
+        spawn_sync_worker(&config, &paths, &message)?;
     } else {
         eprintln!("memo: sync disabled (auto_sync=false)");
     }
@@ -365,6 +381,58 @@ fn append_entry(path: &Path, content: &str) -> Result<(), String> {
     }
     file.write_all(content.as_bytes())
         .map_err(|error| format!("cannot append memo entry: {error}"))?;
+    Ok(())
+}
+
+fn tag_registry_path() -> Result<PathBuf, String> {
+    config_path()
+        .parent()
+        .map(|parent| parent.join("tags"))
+        .ok_or_else(|| "cannot resolve memo tag registry path".into())
+}
+
+fn register_tags(tags: &[String]) -> Result<(), String> {
+    let new_tags = tags
+        .iter()
+        .filter(|tag| tag.as_str() != "inbox")
+        .filter(|tag| tag.as_str() != "")
+        .collect::<Vec<_>>();
+    if new_tags.is_empty() {
+        return Ok(());
+    }
+    let path = tag_registry_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create memo config directory: {error}"))?;
+    }
+    let existing = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("cannot read memo tag registry: {error}")),
+    };
+    let registered = existing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut updated = existing.clone();
+    for tag in new_tags {
+        if registered.iter().any(|value| value == tag.as_str())
+            || updated.lines().any(|line| line.trim() == tag.as_str())
+        {
+            continue;
+        }
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(tag);
+        updated.push('\n');
+    }
+    if updated != existing {
+        fs::write(&path, updated)
+            .map_err(|error| format!("cannot update memo tag registry: {error}"))?;
+    }
     Ok(())
 }
 

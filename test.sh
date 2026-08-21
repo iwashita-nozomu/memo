@@ -46,8 +46,12 @@ output="$(
 entry="$(printf '%s\n' "$output" | tail -n 1)"
 entry="${entry#saved: }"
 test -f "$entry"
+todo_mirror="$work/memo/todo/test/$(date +%F).md"
+test -f "$todo_mirror"
 grep -Fq 'tags: todo' "$entry"
 grep -Fq 'test memo' "$entry"
+grep -Fq 'test memo' "$todo_mirror"
+grep -Fxq 'todo' "$work/home/.config/memo/tags"
 
 second_output="$(
     HOME="$work/home" \
@@ -62,8 +66,10 @@ second_output="$(
 second_entry="$(printf '%s\n' "$second_output" | tail -n 1)"
 second_entry="${second_entry#saved: }"
 test "$entry" = "$second_entry"
+reference_mirror="$work/memo/reference/test/$(date +%F).md"
+test -f "$reference_mirror"
 grep -Fq 'tags: reference' "$entry"
 grep -Fq 'second memo' "$entry"
-test ! -e "$work/memo/todo"
-test ! -e "$work/memo/reference"
-printf 'ok - Rust memo appends entries to one daily file without tag mirrors\n'
+grep -Fq 'second memo' "$reference_mirror"
+grep -Fxq 'reference' "$work/home/.config/memo/tags"
+printf 'ok - Rust memo appends daily files and mirrors registered tags\n'
