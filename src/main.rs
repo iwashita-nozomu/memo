@@ -75,7 +75,7 @@ fn run() -> Result<(), String> {
     let config = Config::load()?;
     validate_repo(&config)?;
     let initial_state = if config.auto_sync {
-        Some(capture_state(&config.repo))
+        Some(synchronize_before_entry(&config)?)
     } else {
         None
     };
@@ -405,6 +405,36 @@ fn capture_state(repo: &Path) -> GitState {
         upstream,
         ahead,
     }
+}
+
+fn synchronize_before_entry(config: &Config) -> Result<GitState, String> {
+    let before = capture_state(&config.repo);
+    let Some(upstream) = before.upstream.clone() else {
+        return Ok(before);
+    };
+    let (remote, branch) = upstream
+        .split_once('/')
+        .unwrap_or(("origin", &before.branch));
+    command_in(
+        &config.repo,
+        "git",
+        &["fetch".to_string(), remote.to_string()],
+    )?;
+    eprintln!("memo: fetched {remote}/{branch}");
+
+    if before.status.is_empty() && before.ahead == 0 {
+        command_in(
+            &config.repo,
+            "git",
+            &[
+                "merge".to_string(),
+                "--ff-only".to_string(),
+                upstream.clone(),
+            ],
+        )?;
+        eprintln!("memo: synchronized {remote}/{branch}");
+    }
+    Ok(capture_state(&config.repo))
 }
 
 fn sync_entry(

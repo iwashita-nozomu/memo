@@ -43,11 +43,12 @@ mirrors are generated when the entry is created.
 
 ## Synchronization
 
-With auto_sync = true (the default), only the new entry and its mirrors are
-staged and committed. If the checkout has an upstream, the commit is pushed
-and the command prints commit/push progress. A push race is retried with
-fetch/rebase only when the worktree was clean and had no existing unpushed
-commits. Existing changes are never staged, rebased, or pushed implicitly.
+With auto_sync = true (the default), every invocation fetches the configured
+upstream before writing. A clean checkout with no local commits is fast-forwarded
+to the fetched upstream. The new entry and its mirrors are then staged and
+committed, pushed, and reported. Existing dirty changes and local commits are
+never staged, rebased, or pushed implicitly; if they prevent a push, the new
+entry remains committed locally with a pending-push error.
 
 Set auto_sync = false for local-only notes. MEMO_AUTO_SYNC=0 is a temporary
 override.
