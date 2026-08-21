@@ -1,7 +1,9 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = "0.1.0";
@@ -39,6 +41,9 @@ fn run() -> Result<(), String> {
         print_help();
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("--sync") {
+        return run_sync_worker(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("--check-config") {
         if args.len() != 1 {
             return Err("--check-config does not accept additional arguments".into());
@@ -74,11 +79,6 @@ fn run() -> Result<(), String> {
 
     let config = Config::load()?;
     validate_repo(&config)?;
-    let initial_state = if config.auto_sync {
-        Some(synchronize_before_entry(&config)?)
-    } else {
-        None
-    };
     let timestamp = command_text("date", &["+%Y-%m-%dT%H:%M:%S%:z"])?;
     if !timestamp.contains('T') {
         return Err(format!("date returned an invalid timestamp: {timestamp}"));
@@ -128,12 +128,13 @@ fn run() -> Result<(), String> {
         paths.push(mirror);
     }
 
-    println!("{}", source.display());
-    if !config.auto_sync {
-        eprintln!("memo: saved without commit/push (auto_sync=false)");
-        return Ok(());
+    println!("saved: {}", source.display());
+    if config.auto_sync {
+        spawn_sync_worker(&config, &paths, &message)?;
+    } else {
+        eprintln!("memo: sync disabled (auto_sync=false)");
     }
-    sync_entry(&config, &paths, &message, initial_state.as_ref())
+    Ok(())
 }
 
 impl Config {
@@ -368,13 +369,27 @@ fn format_entry(
     content
 }
 
-fn capture_state(repo: &Path) -> GitState {
-    let status = command_text_in(
+fn capture_state(repo: &Path, ignored_paths: &[PathBuf]) -> GitState {
+    let raw_status = command_text_in(
         repo,
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
     )
     .unwrap_or_default();
+    let status = raw_status
+        .lines()
+        .filter(|line| {
+            let path = line
+                .get(3..)
+                .unwrap_or("")
+                .split(" -> ")
+                .last()
+                .unwrap_or("");
+            let full_path = repo.join(path);
+            !ignored_paths.iter().any(|ignored| ignored == &full_path)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let branch = command_text_in(repo, "git", &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .unwrap_or_default()
         .trim()
@@ -407,8 +422,11 @@ fn capture_state(repo: &Path) -> GitState {
     }
 }
 
-fn synchronize_before_entry(config: &Config) -> Result<GitState, String> {
-    let before = capture_state(&config.repo);
+fn synchronize_before_entry(
+    config: &Config,
+    ignored_paths: &[PathBuf],
+) -> Result<GitState, String> {
+    let before = capture_state(&config.repo, ignored_paths);
     let Some(upstream) = before.upstream.clone() else {
         return Ok(before);
     };
@@ -434,27 +452,99 @@ fn synchronize_before_entry(config: &Config) -> Result<GitState, String> {
         )?;
         eprintln!("memo: synchronized {remote}/{branch}");
     }
-    Ok(capture_state(&config.repo))
+    Ok(capture_state(&config.repo, ignored_paths))
+}
+
+fn sync_error_path(repo: &Path) -> PathBuf {
+    repo.join(".memo-sync-error.log")
+}
+
+fn spawn_sync_worker(config: &Config, paths: &[PathBuf], message: &str) -> Result<(), String> {
+    let executable = env::current_exe()
+        .map_err(|error| format!("cannot locate memo executable for background sync: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--sync")
+        .arg(message)
+        .args(paths)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = command.spawn() {
+        write_sync_error(
+            &config.repo,
+            &format!("cannot start background sync: {error}"),
+        );
+    }
+    Ok(())
+}
+
+fn run_sync_worker(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("background sync requires a message and at least one path".into());
+    }
+    let message = args[0].clone();
+    let paths = args[1..].iter().map(PathBuf::from).collect::<Vec<_>>();
+    let config = Config::load()?;
+    validate_repo(&config)?;
+    let error_path = sync_error_path(&config.repo);
+    let mut ignored_paths = paths.clone();
+    ignored_paths.push(error_path.clone());
+    let result = (|| {
+        let _lock = acquire_sync_lock(&config.repo)?;
+        let before = synchronize_before_entry(&config, &ignored_paths)?;
+        sync_entry(&config, &paths, &message, &before)
+    })();
+    match result {
+        Ok(()) => {
+            let _ = fs::remove_file(error_path);
+        }
+        Err(error) => write_sync_error(&config.repo, &error),
+    }
+    Ok(())
+}
+
+fn acquire_sync_lock(repo: &Path) -> Result<SyncLock, String> {
+    let lock_path = repo.join(".git").join("memo-sync.lock");
+    for _ in 0..600 {
+        match fs::create_dir(&lock_path) {
+            Ok(()) => {
+                fs::write(lock_path.join("pid"), std::process::id().to_string())
+                    .map_err(|error| format!("cannot write sync lock: {error}"))?;
+                return Ok(SyncLock { path: lock_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("cannot create sync lock: {error}")),
+        }
+    }
+    Err("background sync lock remained busy for 60 seconds".into())
+}
+
+struct SyncLock {
+    path: PathBuf,
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path.join("pid"));
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn write_sync_error(repo: &Path, error: &str) {
+    let path = sync_error_path(repo);
+    let body = format!("memo background sync error\n{error}\n");
+    let _ = fs::write(path, body);
 }
 
 fn sync_entry(
     config: &Config,
     paths: &[PathBuf],
     message: &str,
-    before: Option<&GitState>,
+    before: &GitState,
 ) -> Result<(), String> {
-    let empty_state;
-    let before = if let Some(before) = before {
-        before
-    } else {
-        empty_state = GitState {
-            status: String::new(),
-            branch: String::new(),
-            upstream: None,
-            ahead: 0,
-        };
-        &empty_state
-    };
     let mut add_args = vec!["add".to_string(), "--".to_string()];
     add_args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
     command_in(&config.repo, "git", &add_args)?;
@@ -495,14 +585,69 @@ fn sync_entry(
         "git",
         &["fetch".to_string(), remote.to_string()],
     )?;
-    command_in(
-        &config.repo,
-        "git",
-        &["rebase".to_string(), format!("{remote}/{branch}")],
-    )?;
+    rebase_with_auto_resolution(&config.repo, &format!("{remote}/{branch}"), paths)?;
     push(&config.repo, remote, branch)?;
     eprintln!("memo: pushed {remote}/{branch} after fetch/rebase");
     Ok(())
+}
+
+fn rebase_with_auto_resolution(
+    repo: &Path,
+    upstream: &str,
+    memo_paths: &[PathBuf],
+) -> Result<(), String> {
+    let first_error = match command_in(repo, "git", &["rebase".to_string(), upstream.to_string()]) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    for _ in 0..10 {
+        let conflicts = command_text_in(repo, "git", &["diff", "--name-only", "--diff-filter=U"])?
+            .lines()
+            .map(str::to_string)
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        if conflicts.is_empty() {
+            if command_in(repo, "git", &["rebase".to_string(), "--skip".to_string()]).is_ok() {
+                return Ok(());
+            }
+            break;
+        }
+        for path in conflicts {
+            let full_path = repo.join(&path);
+            let side = if memo_paths.iter().any(|memo_path| memo_path == &full_path) {
+                "theirs"
+            } else {
+                "ours"
+            };
+            command_in(
+                repo,
+                "git",
+                &[
+                    "checkout".to_string(),
+                    side.to_string(),
+                    "--".to_string(),
+                    path.clone(),
+                ],
+            )?;
+            command_in(repo, "git", &["add".to_string(), "--".to_string(), path])?;
+        }
+        if command_in(
+            repo,
+            "git",
+            &[
+                "-c".to_string(),
+                "core.editor=true".to_string(),
+                "rebase".to_string(),
+                "--continue".to_string(),
+            ],
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    let _ = command_in(repo, "git", &["rebase".to_string(), "--abort".to_string()]);
+    Err(format!("automatic rebase resolution failed: {first_error}"))
 }
 
 fn push(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {

@@ -2,8 +2,14 @@
 
 set -euo pipefail
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-manifest="$repo_root/memo/Cargo.toml"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -f "$script_dir/Cargo.toml" ]]; then
+    repo_root="$script_dir"
+    manifest="$repo_root/Cargo.toml"
+else
+    repo_root="$(cd -- "$script_dir/.." && pwd -P)"
+    manifest="$repo_root/memo/Cargo.toml"
+fi
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 rustup_toolchain="${RUSTUP_TOOLCHAIN:-stable-x86_64-unknown-linux-gnu}"
@@ -38,6 +44,7 @@ output="$(
     cargo run --quiet --manifest-path "$manifest" -- --tag todo 'test memo'
 )"
 entry="$(printf '%s\n' "$output" | tail -n 1)"
+entry="${entry#saved: }"
 test -f "$entry"
 mirror_path="${entry/\/inbox\//\/todo\/}"
 test -f "$mirror_path"

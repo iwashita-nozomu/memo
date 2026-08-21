@@ -43,12 +43,12 @@ mirrors are generated when the entry is created.
 
 ## Synchronization
 
-With auto_sync = true (the default), every invocation fetches the configured
-upstream before writing. A clean checkout with no local commits is fast-forwarded
-to the fetched upstream. The new entry and its mirrors are then staged and
-committed, pushed, and reported. Existing dirty changes and local commits are
-never staged, rebased, or pushed implicitly; if they prevent a push, the new
-entry remains committed locally with a pending-push error.
+With auto_sync = true (the default), memo prints saved as soon as the entry and
+its mirrors are written. Fetch, fast-forward, commit, and push then run in a
+background worker. A failed worker writes an untracked
+`<repo>/.memo-sync-error.log`; a later successful sync removes it.
+Rebase conflicts are resolved automatically, preferring the new memo files.
+Existing dirty changes and local commits are never staged or rebased implicitly.
 
 Set auto_sync = false for local-only notes. MEMO_AUTO_SYNC=0 is a temporary
 override.
