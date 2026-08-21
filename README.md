@@ -10,17 +10,17 @@ Rust/Cargo is the only build prerequisite:
 
     bash ./install.sh
 
-The installer compiles the local source into ~/.local/bin/memo and creates
-~/.config/memo/config.toml from the example only when that file does not
-already exist. Edit the config and set the repository that should hold notes:
+The installer compiles the local source into ~/.local/bin/memo. The config is
+managed by the integration that invokes this installer; create
+~/.config/memo/config.toml and set the repository that should hold notes:
 
     repo = "~/til"
     auto_sync = true
     # remote = "git@github.com:your-account/your-memo-repo.git"
     # environment = "gpu003-ubuntu2404"
 
-XDG_CONFIG_HOME is honored. MEMO_CONFIG can select one config file for a
-test or a special environment.
+XDG_CONFIG_HOME is honored by the CLI. MEMO_CONFIG can select one config file
+for a test or a special environment.
 
 ## Entries and tags
 
