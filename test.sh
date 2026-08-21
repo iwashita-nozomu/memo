@@ -46,8 +46,24 @@ output="$(
 entry="$(printf '%s\n' "$output" | tail -n 1)"
 entry="${entry#saved: }"
 test -f "$entry"
-mirror_path="${entry/\/inbox\//\/todo\/}"
-test -f "$mirror_path"
 grep -Fq 'tags: todo' "$entry"
 grep -Fq 'test memo' "$entry"
-printf 'ok - Rust memo writes inbox entries and tag mirrors\n'
+
+second_output="$(
+    HOME="$work/home" \
+    MEMO_CONFIG="$work/home/.config/memo/config.toml" \
+    MEMO_AUTO_SYNC=0 \
+    MEMO_ENVIRONMENT=test \
+    RUSTUP_HOME="$rustup_home" \
+    CARGO_HOME="$cargo_home" \
+    RUSTUP_TOOLCHAIN="$rustup_toolchain" \
+    cargo run --quiet --manifest-path "$manifest" -- --tag reference 'second memo'
+)"
+second_entry="$(printf '%s\n' "$second_output" | tail -n 1)"
+second_entry="${second_entry#saved: }"
+test "$entry" = "$second_entry"
+grep -Fq 'tags: reference' "$entry"
+grep -Fq 'second memo' "$entry"
+test ! -e "$work/memo/todo"
+test ! -e "$work/memo/reference"
+printf 'ok - Rust memo appends entries to one daily file without tag mirrors\n'

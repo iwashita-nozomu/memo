@@ -1,12 +1,13 @@
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 
 #[derive(Debug)]
 struct Config {
@@ -82,7 +83,6 @@ fn run() -> Result<(), String> {
         return Err(format!("date returned an invalid timestamp: {timestamp}"));
     }
     let date = timestamp.split('T').next().unwrap_or("unknown-date");
-    let timestamp_slug = timestamp.replace(':', "-");
     let environment = configured_environment(&config)?;
     let cwd = env::current_dir()
         .map_err(|error| format!("cannot resolve current directory: {error}"))?
@@ -91,14 +91,11 @@ fn run() -> Result<(), String> {
     let message = args.join(" ");
     let tags = unique_tags(tags);
     let tags_text = tags.join(",");
-    let random = unique_suffix();
-    let filename = format!("{timestamp_slug}_{random}.md");
     let data_root = config.repo.join("memo");
     let source = data_root
         .join("inbox")
         .join(&environment)
-        .join(date)
-        .join(&filename);
+        .join(format!("{date}.md"));
     let git_context = git_context(&cwd);
     let content = format_entry(
         &timestamp,
@@ -108,27 +105,14 @@ fn run() -> Result<(), String> {
         git_context.as_ref(),
         &message,
     );
-    fs::create_dir_all(source.parent().expect("source has a parent"))
-        .map_err(|error| format!("cannot create memo directory: {error}"))?;
-    fs::write(&source, &content).map_err(|error| format!("cannot write memo: {error}"))?;
-
-    let mut paths = vec![source.clone()];
-    for tag in tags.iter().filter(|tag| tag.as_str() != "inbox") {
-        let mirror = data_root
-            .join(tag)
-            .join(&environment)
-            .join(date)
-            .join(&filename);
-        fs::create_dir_all(mirror.parent().expect("mirror has a parent"))
-            .map_err(|error| format!("cannot create tag mirror directory: {error}"))?;
-        fs::write(&mirror, &content)
-            .map_err(|error| format!("cannot write tag mirror: {error}"))?;
-        paths.push(mirror);
+    {
+        let _lock = acquire_sync_lock(&config.repo)?;
+        append_entry(&source, &content)?;
     }
 
     println!("saved: {}", source.display());
     if config.auto_sync {
-        spawn_sync_worker(&config, &paths, &message)?;
+        spawn_sync_worker(&config, std::slice::from_ref(&source), &message)?;
     } else {
         eprintln!("memo: sync disabled (auto_sync=false)");
     }
@@ -311,14 +295,6 @@ fn unique_tags(tags: Vec<String>) -> Vec<String> {
     unique
 }
 
-fn unique_suffix() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{}", std::process::id(), nanos % 1_000_000_000_000u128)
-}
-
 fn git_context(cwd: &Path) -> Option<Vec<(String, String)>> {
     let root = command_text_in(cwd, "git", &["rev-parse", "--show-toplevel"])
         .ok()?
@@ -367,6 +343,31 @@ fn format_entry(
     content
 }
 
+fn append_entry(path: &Path, content: &str) -> Result<(), String> {
+    let existing = fs::read(path).unwrap_or_default();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create memo directory: {error}"))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("cannot open memo file {}: {error}", path.display()))?;
+    if !existing.is_empty() {
+        if existing.ends_with(b"\n") {
+            file.write_all(b"\n")
+                .map_err(|error| format!("cannot separate memo entries: {error}"))?;
+        } else {
+            file.write_all(b"\n\n")
+                .map_err(|error| format!("cannot separate memo entries: {error}"))?;
+        }
+    }
+    file.write_all(content.as_bytes())
+        .map_err(|error| format!("cannot append memo entry: {error}"))?;
+    Ok(())
+}
+
 fn capture_state(repo: &Path) -> GitState {
     let branch = command_text_in(repo, "git", &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .unwrap_or_default()
@@ -388,6 +389,28 @@ fn capture_state(repo: &Path) -> GitState {
     GitState { branch, upstream }
 }
 
+fn has_pending_memo_work(repo: &Path, upstream: &str) -> bool {
+    let working_tree = command_text_in(repo, "git", &["status", "--porcelain", "--", "memo"])
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(true);
+    if working_tree {
+        return true;
+    }
+    command_text_in(
+        repo,
+        "git",
+        &[
+            "diff",
+            "--name-only",
+            &format!("{upstream}..HEAD"),
+            "--",
+            "memo",
+        ],
+    )
+    .map(|value| !value.trim().is_empty())
+    .unwrap_or(true)
+}
+
 fn synchronize_before_entry(config: &Config) -> Result<GitState, String> {
     let before = capture_state(&config.repo);
     let Some(upstream) = before.upstream.clone() else {
@@ -401,6 +424,10 @@ fn synchronize_before_entry(config: &Config) -> Result<GitState, String> {
         "git",
         &["fetch".to_string(), remote.to_string()],
     )?;
+    if has_pending_memo_work(&config.repo, &upstream) {
+        eprintln!("memo: keeping pending memo changes before synchronization");
+        return Ok(before);
+    }
     let _ = command_in(
         &config.repo,
         "git",
@@ -511,22 +538,33 @@ fn sync_entry(
     let mut add_args = vec!["add".to_string(), "--".to_string()];
     add_args.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
     command_in(&config.repo, "git", &add_args)?;
-    let summary = message.lines().next().unwrap_or("entry");
-    let commit_paths = paths
+    let staged_paths = paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let mut commit_args = vec![
-        "commit".to_string(),
-        "--only".to_string(),
-        "--no-verify".to_string(),
-        "-m".to_string(),
-        format!("memo: {summary}"),
+    let mut diff_args = vec![
+        "diff".to_string(),
+        "--cached".to_string(),
+        "--quiet".to_string(),
         "--".to_string(),
     ];
-    commit_args.extend(commit_paths);
-    command_in(&config.repo, "git", &commit_args)?;
-    eprintln!("memo: committed {} file(s)", paths.len());
+    diff_args.extend(staged_paths.iter().cloned());
+    if command_in(&config.repo, "git", &diff_args).is_err() {
+        let summary = message.lines().next().unwrap_or("entry");
+        let mut commit_args = vec![
+            "commit".to_string(),
+            "--only".to_string(),
+            "--no-verify".to_string(),
+            "-m".to_string(),
+            format!("memo: {summary}"),
+            "--".to_string(),
+        ];
+        commit_args.extend(staged_paths);
+        command_in(&config.repo, "git", &commit_args)?;
+        eprintln!("memo: committed {} file(s)", paths.len());
+    } else {
+        eprintln!("memo: no new memo changes to commit");
+    }
     let Some(upstream) = before.upstream.clone() else {
         eprintln!("memo: committed locally; no upstream configured, push skipped");
         return Ok(());
@@ -549,6 +587,59 @@ fn sync_entry(
     push(&config.repo, remote, branch)?;
     eprintln!("memo: pushed {remote}/{branch} after fetch/rebase");
     Ok(())
+}
+
+fn merge_append_only(ours: &str, theirs: &str) -> String {
+    let ours_lines = ours.lines().collect::<Vec<_>>();
+    let theirs_lines = theirs.lines().collect::<Vec<_>>();
+    let mut common = 0;
+    while common < ours_lines.len()
+        && common < theirs_lines.len()
+        && ours_lines[common] == theirs_lines[common]
+    {
+        common += 1;
+    }
+    let mut merged = ours_lines[..common].to_vec();
+    merged.extend_from_slice(&ours_lines[common..]);
+    merged.extend_from_slice(&theirs_lines[common..]);
+    let mut result = merged.join("\n");
+    if ours.ends_with('\n') || theirs.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+fn merge_memo_conflict(path: &Path) -> Result<(), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read memo conflict {}: {error}", path.display()))?;
+    let mut merged = String::new();
+    let mut ours = String::new();
+    let mut theirs = String::new();
+    let mut side = 0;
+    for chunk in content.split_inclusive('\n') {
+        let marker = chunk.trim_end_matches(['\n', '\r']);
+        if side == 0 && marker.starts_with("<<<<<<<") {
+            side = 1;
+        } else if side == 1 && marker == "=======" {
+            side = 2;
+        } else if side == 2 && marker.starts_with(">>>>>>>") {
+            merged.push_str(&merge_append_only(&ours, &theirs));
+            ours.clear();
+            theirs.clear();
+            side = 0;
+        } else if side == 0 {
+            merged.push_str(chunk);
+        } else if side == 1 {
+            ours.push_str(chunk);
+        } else {
+            theirs.push_str(chunk);
+        }
+    }
+    if side != 0 {
+        return Err(format!("incomplete memo conflict in {}", path.display()));
+    }
+    fs::write(path, merged)
+        .map_err(|error| format!("cannot write merged memo {}: {error}", path.display()))
 }
 
 fn rebase_with_auto_resolution(
@@ -574,11 +665,12 @@ fn rebase_with_auto_resolution(
         }
         for path in conflicts {
             let full_path = repo.join(&path);
-            let side = if memo_paths.iter().any(|memo_path| memo_path == &full_path) {
-                "theirs"
-            } else {
-                "ours"
-            };
+            if memo_paths.iter().any(|memo_path| memo_path == &full_path) {
+                merge_memo_conflict(&full_path)?;
+                command_in(repo, "git", &["add".to_string(), "--".to_string(), path])?;
+                continue;
+            }
+            let side = "ours";
             command_in(
                 repo,
                 "git",
@@ -686,6 +778,14 @@ mod tests {
         assert_eq!(
             unique_tags(vec!["todo".into(), "todo".into(), "work".into()]),
             vec!["todo", "work"]
+        );
+    }
+
+    #[test]
+    fn append_merge_keeps_both_device_suffixes() {
+        assert_eq!(
+            merge_append_only("base\nremote\n", "base\nlocal\n"),
+            "base\nremote\nlocal\n"
         );
     }
 }

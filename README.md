@@ -1,8 +1,8 @@
 # memo
 
 memo is a small Rust CLI for recording short, context-aware Markdown notes.
-The command does not open an editor. It writes an entry, optionally creates tag
-mirrors, and can commit/push only the files it just created.
+The command does not open an editor. It appends each entry to one daily file
+for the current environment and can commit/push that file in the background.
 
 ## Install
 
@@ -24,9 +24,9 @@ for a test or a special environment.
 
 ## Entries and tags
 
-An entry is stored under:
+Entries are appended to:
 
-    <repo>/memo/inbox/<environment>/YYYY-MM-DD/<timestamp>_<random>.md
+    <repo>/memo/inbox/<environment>/YYYY-MM-DD.md
 
 The environment comes from environment in the config, then
 MEMO_ENVIRONMENT, WSL_DISTRO_NAME, or the short hostname. The Markdown
@@ -37,18 +37,17 @@ context when the current directory is inside a Git worktree.
     memo tag:todo "あとで片付ける作業"
     memo --tag reference "参照用メモ"
 
-Every tag except inbox is mirrored at
-<repo>/memo/<tag>/<environment>/YYYY-MM-DD/. The inbox entry is the source;
-mirrors are generated when the entry is created.
+Tags are kept in each entry's `tags:` metadata. No tag mirror files are
+created, so a memo command only adds to the current environment/date file.
 
 ## Synchronization
 
-With auto_sync = true (the default), memo prints saved as soon as the entry and
-its mirrors are written. Fetch, reset to upstream, commit, and push then run in
-a background worker. Tracked dirty changes and local commits in the memo
-repository are discarded by this synchronization. A failed worker writes an
-untracked `<repo>/.memo-sync-error.log`; a later successful sync removes
-it. Rebase conflicts are resolved automatically, preferring the new memo files.
+With auto_sync = true (the default), memo prints saved as soon as the entry is
+appended. Fetch, reset to upstream when there are no pending memo changes,
+commit, and push then run in a background worker. Rebase conflicts in daily
+memo files are merged as append-only content so entries from both devices are
+kept. A failed worker writes an untracked `<repo>/.memo-sync-error.log`; a
+later successful sync removes it.
 
 Set auto_sync = false for local-only notes. MEMO_AUTO_SYNC=0 is a temporary
 override.
