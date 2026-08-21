@@ -18,10 +18,8 @@ struct Config {
 
 #[derive(Debug)]
 struct GitState {
-    status: String,
     branch: String,
     upstream: Option<String>,
-    ahead: u64,
 }
 
 fn main() {
@@ -369,27 +367,7 @@ fn format_entry(
     content
 }
 
-fn capture_state(repo: &Path, ignored_paths: &[PathBuf]) -> GitState {
-    let raw_status = command_text_in(
-        repo,
-        "git",
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )
-    .unwrap_or_default();
-    let status = raw_status
-        .lines()
-        .filter(|line| {
-            let path = line
-                .get(3..)
-                .unwrap_or("")
-                .split(" -> ")
-                .last()
-                .unwrap_or("");
-            let full_path = repo.join(path);
-            !ignored_paths.iter().any(|ignored| ignored == &full_path)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+fn capture_state(repo: &Path) -> GitState {
     let branch = command_text_in(repo, "git", &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .unwrap_or_default()
         .trim()
@@ -407,26 +385,11 @@ fn capture_state(repo: &Path, ignored_paths: &[PathBuf]) -> GitState {
     .ok()
     .map(|value| value.trim().to_string())
     .filter(|value| !value.is_empty());
-    let ahead = upstream
-        .as_ref()
-        .and_then(|_| {
-            command_text_in(repo, "git", &["rev-list", "--count", "@{upstream}..HEAD"]).ok()
-        })
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    GitState {
-        status,
-        branch,
-        upstream,
-        ahead,
-    }
+    GitState { branch, upstream }
 }
 
-fn synchronize_before_entry(
-    config: &Config,
-    ignored_paths: &[PathBuf],
-) -> Result<GitState, String> {
-    let before = capture_state(&config.repo, ignored_paths);
+fn synchronize_before_entry(config: &Config) -> Result<GitState, String> {
+    let before = capture_state(&config.repo);
     let Some(upstream) = before.upstream.clone() else {
         return Ok(before);
     };
@@ -438,21 +401,23 @@ fn synchronize_before_entry(
         "git",
         &["fetch".to_string(), remote.to_string()],
     )?;
-    eprintln!("memo: fetched {remote}/{branch}");
-
-    if before.status.is_empty() && before.ahead == 0 {
-        command_in(
-            &config.repo,
-            "git",
-            &[
-                "merge".to_string(),
-                "--ff-only".to_string(),
-                upstream.clone(),
-            ],
-        )?;
-        eprintln!("memo: synchronized {remote}/{branch}");
-    }
-    Ok(capture_state(&config.repo, ignored_paths))
+    let _ = command_in(
+        &config.repo,
+        "git",
+        &["rebase".to_string(), "--abort".to_string()],
+    );
+    let _ = command_in(
+        &config.repo,
+        "git",
+        &["merge".to_string(), "--abort".to_string()],
+    );
+    command_in(
+        &config.repo,
+        "git",
+        &["reset".to_string(), "--hard".to_string(), upstream.clone()],
+    )?;
+    eprintln!("memo: synchronized {remote}/{branch} (local changes reset)");
+    Ok(capture_state(&config.repo))
 }
 
 fn sync_error_path(repo: &Path) -> PathBuf {
@@ -488,11 +453,9 @@ fn run_sync_worker(args: &[String]) -> Result<(), String> {
     let config = Config::load()?;
     validate_repo(&config)?;
     let error_path = sync_error_path(&config.repo);
-    let mut ignored_paths = paths.clone();
-    ignored_paths.push(error_path.clone());
     let result = (|| {
         let _lock = acquire_sync_lock(&config.repo)?;
-        let before = synchronize_before_entry(&config, &ignored_paths)?;
+        let before = synchronize_before_entry(&config)?;
         sync_entry(&config, &paths, &message, &before)
     })();
     match result {
@@ -575,9 +538,6 @@ fn sync_entry(
     if push_result.is_ok() {
         eprintln!("memo: pushed {remote}/{branch}");
         return Ok(());
-    }
-    if !before.status.is_empty() || before.ahead != 0 {
-        return Err("entry committed locally but push is pending; existing worktree/local commits were preserved".into());
     }
     eprintln!("memo: push raced with a remote update; fetching and rebasing before retry");
     command_in(
