@@ -1,0 +1,10 @@
+[package]
+name = "memo"
+version = "0.1.0"
+edition = "2021"
+description = "Small context-aware memo CLI with tag mirrors"
+license = "MIT"
+
+[[bin]]
+name = "memo"
+path = "src/main.rs"

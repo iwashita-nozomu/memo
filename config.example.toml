@@ -1,0 +1,11 @@
+# Path to the user's memo Git repository. ~/ is expanded by memo.
+repo = "~/til"
+
+# Optional: reject a checkout whose origin does not match this URL.
+# remote = "git@github.com:your-account/your-memo-repo.git"
+
+# Optional stable environment name used in memo paths and metadata.
+# environment = "gpu003-ubuntu2404"
+
+# Commit/push each new entry. Set false to save locally only.
+auto_sync = true
