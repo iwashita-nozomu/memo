@@ -50,12 +50,16 @@ fn run() -> Result<(), String> {
         }
         let config = Config::load()?;
         validate_repo(&config)?;
+        let metadata_script = metadata_script_path(&config)?;
+        if !metadata_script.is_file() {
+            return Err(format!(
+                "metadata script is missing: {}",
+                metadata_script.display()
+            ));
+        }
         println!("memo config: {}", config_path().display());
         println!("memo repo: {}", config.repo.display());
-        println!(
-            "metadata script: {}",
-            metadata_script_path(&config)?.display()
-        );
+        println!("metadata script: {}", metadata_script.display());
         return Ok(());
     }
     let mut tags = Vec::new();
