@@ -34,6 +34,25 @@ MEMO_ENVIRONMENT, WSL_DISTRO_NAME, or the short hostname. The Markdown
 metadata includes timestamp, environment, tags, working directory, and Git
 context when the current directory is inside a Git worktree.
 
+Each entry uses this stable format; metadata and body are kept in the same
+Markdown text:
+
+    ## 2026-08-22T10:30:00+09:00
+
+    <!-- memo
+    timestamp: "2026-08-22T10:30:00+09:00"
+    environment: "gpu003"
+    tags:
+      - "todo"
+    cwd: "/home/niwashita/workspace"
+    git:
+      root: "/home/niwashita/workspace"
+      branch: "main"
+      head: "abc1234"
+    -->
+
+    p(x_t+1|x_t) ...
+
     memo "通常のinboxメモ"
     memo tag:todo "あとで片付ける作業"
     memo --tag reference "参照用メモ"

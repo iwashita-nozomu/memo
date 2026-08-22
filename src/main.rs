@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 
 #[derive(Debug)]
 struct Config {
@@ -90,7 +90,6 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("cannot resolve current directory: {error}"))?;
     let message = args.join(" ");
     let tags = unique_tags(tags);
-    let tags_text = tags.join(",");
     let data_root = config.repo.join("memo");
     let source = data_root
         .join("inbox")
@@ -100,7 +99,7 @@ fn run() -> Result<(), String> {
     let content = format_entry(
         &timestamp,
         &environment,
-        &tags_text,
+        &tags,
         &cwd,
         git_context.as_ref(),
         &message,
@@ -338,24 +337,56 @@ fn git_context(cwd: &Path) -> Option<Vec<(String, String)>> {
     ])
 }
 
+fn yaml_quote(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn format_entry(
     timestamp: &str,
     environment: &str,
-    tags: &str,
+    tags: &[String],
     cwd: &Path,
     git: Option<&Vec<(String, String)>>,
     message: &str,
 ) -> String {
     let mut content = format!(
-        "## {timestamp}\n\nenvironment: {environment}\ntags: {tags}\ncwd: {}\n",
-        cwd.display()
+        "## {timestamp}\n\n<!-- memo\ntimestamp: {}\nenvironment: {}\ntags:",
+        yaml_quote(timestamp),
+        yaml_quote(environment),
     );
-    if let Some(git) = git {
-        for (key, value) in git {
-            content.push_str(&format!("{key}: {value}\n"));
+    if tags.is_empty() {
+        content.push_str(" []\n");
+    } else {
+        content.push('\n');
+        for tag in tags {
+            content.push_str(&format!("  - {}\n", yaml_quote(tag)));
         }
     }
-    content.push_str(&format!("\n{message}\n"));
+    content.push_str(&format!("cwd: {}\n", yaml_quote(&cwd.to_string_lossy())));
+    if let Some(git) = git {
+        content.push_str("git:\n");
+        for (key, value) in git {
+            let key = key.strip_prefix("git-").unwrap_or(key);
+            content.push_str(&format!("  {key}: {}\n", yaml_quote(value)));
+        }
+    } else {
+        content.push_str("git: {}\n");
+    }
+    content.push_str("-->\n\n");
+    content.push_str(message);
+    content.push('\n');
     content
 }
 
@@ -855,5 +886,27 @@ mod tests {
             merge_append_only("base\nremote\n", "base\nlocal\n"),
             "base\nremote\nlocal\n"
         );
+    }
+
+    #[test]
+    fn entry_metadata_is_embedded_in_a_stable_comment_block() {
+        let tags = vec!["todo".to_string()];
+        let git = vec![
+            ("git-root".to_string(), "/tmp/project".to_string()),
+            ("git-branch".to_string(), "main".to_string()),
+            ("git-head".to_string(), "abc1234".to_string()),
+        ];
+        let content = format_entry(
+            "2026-08-22T10:30:00+09:00",
+            "gpu003",
+            &tags,
+            Path::new("/tmp/project"),
+            Some(&git),
+            "a note",
+        );
+        assert!(content.contains("<!-- memo\n"));
+        assert!(content.contains("tags:\n  - \"todo\"\n"));
+        assert!(content.contains("  root: \"/tmp/project\"\n"));
+        assert!(content.ends_with("-->\n\na note\n"));
     }
 }
