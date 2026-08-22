@@ -1,9 +1,9 @@
 # memo
 
 memo is a small Rust CLI for recording short, context-aware Markdown notes.
-The command does not open an editor. It appends each entry to one daily inbox
-file for the current environment, mirrors tagged entries, and can commit/push
-the changed files in the background.
+The command does not open an editor. Each note is immutable and stored in its
+own content-addressed file, mirrors tagged entries, and can commit/push the
+changed files in the background.
 
 ## Install
 
@@ -25,21 +25,19 @@ for a test or a special environment.
 
 ## Entries and tags
 
-Entries are appended to:
+Each invocation creates one immutable note at:
 
-    <repo>/memo/inbox/<environment>/YYYY-MM-DD.md
+    <repo>/memo/inbox/<sha256-id>
 
 The environment comes from environment in the config, then
 MEMO_ENVIRONMENT, WSL_DISTRO_NAME, or the short hostname. The Markdown
 metadata includes timestamp, environment, tags, working directory, and Git
 context when the current directory is inside a Git worktree.
 
-Each entry uses this stable format; metadata and body are kept in the same
-Markdown text:
+The file contents use Markdown with YAML front matter. The metadata and body
+are separated, while the complete file remains self-contained:
 
-    ## 2026-08-22T10:30:00+09:00
-
-    <!-- memo
+    ---
     timestamp: "2026-08-22T10:30:00+09:00"
     environment: "gpu003"
     tags:
@@ -49,20 +47,25 @@ Markdown text:
       root: "/home/niwashita/workspace"
       branch: "main"
       head: "abc1234"
-    -->
+    ---
 
     p(x_t+1|x_t) ...
+
+The SHA-256 file name is calculated from the complete file contents. Notes
+are not edited in place: an expanded revision is a new file with a new SHA.
+This keeps every note independently readable and makes relationships stable
+when a revision records its parent ID.
 
     memo "通常のinboxメモ"
     memo tag:todo "あとで片付ける作業"
     memo --tag reference "参照用メモ"
 
 Tags are kept in each entry's `tags:` metadata. Tagged entries are also
-mirrored into their tag's daily file.
+mirrored into their tag directory using the same SHA-256 file name.
 
-When a tag is supplied, its entry is also appended to:
+When a tag is supplied, its entry is also written to:
 
-    <repo>/memo/<tag>/<environment>/YYYY-MM-DD.md
+    <repo>/memo/<tag>/<sha256-id>
 
 For example, `tag:todo` writes to both the inbox file and the `todo` mirror.
 New tags automatically create their mirror directory and are registered as
@@ -72,10 +75,10 @@ is not stored in the memo repository or dotfiles.
 ## Synchronization
 
 With auto_sync = true (the default), memo prints saved as soon as the entry and
-its mirrors are appended. Fetch, reset to upstream when there are no pending
-memo changes, commit, and push then run in a background worker. Rebase conflicts
-in daily memo files are merged as append-only content so entries from both
-devices are kept. A failed worker writes an untracked
+its mirrors are written. Fetch, reset to upstream when there are no pending
+memo changes, commit, and push then run in a background worker. Because each
+note has a unique content-addressed path, normal writes do not collide across
+devices. A failed worker writes an untracked
 `<repo>/.memo-sync-error.log`; a later successful sync removes it.
 
 Set auto_sync = false for local-only notes. MEMO_AUTO_SYNC=0 is a temporary

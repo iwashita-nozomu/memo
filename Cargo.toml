@@ -1,9 +1,12 @@
 [package]
 name = "memo"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "Small context-aware memo CLI with daily files and tag mirrors"
+description = "Small context-aware memo CLI with one immutable Markdown file per note"
 license = "MIT"
+
+[dependencies]
+sha2 = "0.10"
 
 [[bin]]
 name = "memo"

@@ -1,13 +1,13 @@
 use std::env;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const VERSION: &str = "0.4.0";
+use sha2::{Digest, Sha256};
+
+const VERSION: &str = "0.5.0";
 
 #[derive(Debug)]
 struct Config {
@@ -82,7 +82,6 @@ fn run() -> Result<(), String> {
     if !timestamp.contains('T') {
         return Err(format!("date returned an invalid timestamp: {timestamp}"));
     }
-    let date = timestamp.split('T').next().unwrap_or("unknown-date");
     let environment = configured_environment(&config)?;
     let cwd = env::current_dir()
         .map_err(|error| format!("cannot resolve current directory: {error}"))?
@@ -91,10 +90,6 @@ fn run() -> Result<(), String> {
     let message = args.join(" ");
     let tags = unique_tags(tags);
     let data_root = config.repo.join("memo");
-    let source = data_root
-        .join("inbox")
-        .join(&environment)
-        .join(format!("{date}.md"));
     let git_context = git_context(&cwd);
     let content = format_entry(
         &timestamp,
@@ -104,24 +99,21 @@ fn run() -> Result<(), String> {
         git_context.as_ref(),
         &message,
     );
+    let id = content_id(&content);
+    let source = data_root.join("inbox").join(&id);
     let mirrors = tags
         .iter()
         .filter(|tag| tag.as_str() != "inbox")
-        .map(|tag| {
-            data_root
-                .join(tag)
-                .join(&environment)
-                .join(format!("{date}.md"))
-        })
+        .map(|tag| data_root.join(tag).join(&id))
         .collect::<Vec<_>>();
     let mut paths = vec![source.clone()];
     paths.extend(mirrors.iter().cloned());
     {
         let _lock = acquire_sync_lock(&config.repo)?;
         register_tags(&tags)?;
-        append_entry(&source, &content)?;
+        write_entry(&source, &content)?;
         for mirror in &mirrors {
-            append_entry(mirror, &content)?;
+            write_entry(mirror, &content)?;
         }
     }
 
@@ -353,6 +345,11 @@ fn yaml_quote(value: &str) -> String {
     quoted
 }
 
+fn content_id(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn format_entry(
     timestamp: &str,
     environment: &str,
@@ -362,7 +359,7 @@ fn format_entry(
     message: &str,
 ) -> String {
     let mut content = format!(
-        "## {timestamp}\n\n<!-- memo\ntimestamp: {}\nenvironment: {}\ntags:",
+        "---\ntimestamp: {}\nenvironment: {}\ntags:",
         yaml_quote(timestamp),
         yaml_quote(environment),
     );
@@ -384,35 +381,35 @@ fn format_entry(
     } else {
         content.push_str("git: {}\n");
     }
-    content.push_str("-->\n\n");
+    content.push_str("---\n\n");
     content.push_str(message);
     content.push('\n');
     content
 }
 
-fn append_entry(path: &Path, content: &str) -> Result<(), String> {
-    let existing = fs::read(path).unwrap_or_default();
+fn write_entry(path: &Path, content: &str) -> Result<(), String> {
+    match fs::read(path) {
+        Ok(existing) if existing == content.as_bytes() => return Ok(()),
+        Ok(_) => {
+            return Err(format!(
+                "memo file already exists with different content: {}",
+                path.display()
+            ))
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "cannot inspect memo file {}: {error}",
+                path.display()
+            ))
+        }
+        Err(_) => {}
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create memo directory: {error}"))?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("cannot open memo file {}: {error}", path.display()))?;
-    if !existing.is_empty() {
-        if existing.ends_with(b"\n") {
-            file.write_all(b"\n")
-                .map_err(|error| format!("cannot separate memo entries: {error}"))?;
-        } else {
-            file.write_all(b"\n\n")
-                .map_err(|error| format!("cannot separate memo entries: {error}"))?;
-        }
-    }
-    file.write_all(content.as_bytes())
-        .map_err(|error| format!("cannot append memo entry: {error}"))?;
-    Ok(())
+    fs::write(path, content)
+        .map_err(|error| format!("cannot write memo file {}: {error}", path.display()))
 }
 
 fn tag_registry_path() -> Result<PathBuf, String> {
@@ -682,70 +679,13 @@ fn sync_entry(
         "git",
         &["fetch".to_string(), remote.to_string()],
     )?;
-    rebase_with_auto_resolution(&config.repo, &format!("{remote}/{branch}"), paths)?;
+    rebase_with_auto_resolution(&config.repo, &format!("{remote}/{branch}"))?;
     push(&config.repo, remote, branch)?;
     eprintln!("memo: pushed {remote}/{branch} after fetch/rebase");
     Ok(())
 }
 
-fn merge_append_only(ours: &str, theirs: &str) -> String {
-    let ours_lines = ours.lines().collect::<Vec<_>>();
-    let theirs_lines = theirs.lines().collect::<Vec<_>>();
-    let mut common = 0;
-    while common < ours_lines.len()
-        && common < theirs_lines.len()
-        && ours_lines[common] == theirs_lines[common]
-    {
-        common += 1;
-    }
-    let mut merged = ours_lines[..common].to_vec();
-    merged.extend_from_slice(&ours_lines[common..]);
-    merged.extend_from_slice(&theirs_lines[common..]);
-    let mut result = merged.join("\n");
-    if ours.ends_with('\n') || theirs.ends_with('\n') {
-        result.push('\n');
-    }
-    result
-}
-
-fn merge_memo_conflict(path: &Path) -> Result<(), String> {
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read memo conflict {}: {error}", path.display()))?;
-    let mut merged = String::new();
-    let mut ours = String::new();
-    let mut theirs = String::new();
-    let mut side = 0;
-    for chunk in content.split_inclusive('\n') {
-        let marker = chunk.trim_end_matches(['\n', '\r']);
-        if side == 0 && marker.starts_with("<<<<<<<") {
-            side = 1;
-        } else if side == 1 && marker == "=======" {
-            side = 2;
-        } else if side == 2 && marker.starts_with(">>>>>>>") {
-            merged.push_str(&merge_append_only(&ours, &theirs));
-            ours.clear();
-            theirs.clear();
-            side = 0;
-        } else if side == 0 {
-            merged.push_str(chunk);
-        } else if side == 1 {
-            ours.push_str(chunk);
-        } else {
-            theirs.push_str(chunk);
-        }
-    }
-    if side != 0 {
-        return Err(format!("incomplete memo conflict in {}", path.display()));
-    }
-    fs::write(path, merged)
-        .map_err(|error| format!("cannot write merged memo {}: {error}", path.display()))
-}
-
-fn rebase_with_auto_resolution(
-    repo: &Path,
-    upstream: &str,
-    memo_paths: &[PathBuf],
-) -> Result<(), String> {
+fn rebase_with_auto_resolution(repo: &Path, upstream: &str) -> Result<(), String> {
     let first_error = match command_in(repo, "git", &["rebase".to_string(), upstream.to_string()]) {
         Ok(()) => return Ok(()),
         Err(error) => error,
@@ -763,12 +703,6 @@ fn rebase_with_auto_resolution(
             break;
         }
         for path in conflicts {
-            let full_path = repo.join(&path);
-            if memo_paths.iter().any(|memo_path| memo_path == &full_path) {
-                merge_memo_conflict(&full_path)?;
-                command_in(repo, "git", &["add".to_string(), "--".to_string(), path])?;
-                continue;
-            }
             let side = "ours";
             command_in(
                 repo,
@@ -881,15 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn append_merge_keeps_both_device_suffixes() {
-        assert_eq!(
-            merge_append_only("base\nremote\n", "base\nlocal\n"),
-            "base\nremote\nlocal\n"
-        );
-    }
-
-    #[test]
-    fn entry_metadata_is_embedded_in_a_stable_comment_block() {
+    fn entry_metadata_is_separated_from_the_body_with_frontmatter() {
         let tags = vec!["todo".to_string()];
         let git = vec![
             ("git-root".to_string(), "/tmp/project".to_string()),
@@ -904,9 +830,10 @@ mod tests {
             Some(&git),
             "a note",
         );
-        assert!(content.contains("<!-- memo\n"));
+        assert!(content.starts_with("---\ntimestamp: \"2026-08-22T10:30:00+09:00\"\n"));
         assert!(content.contains("tags:\n  - \"todo\"\n"));
         assert!(content.contains("  root: \"/tmp/project\"\n"));
-        assert!(content.ends_with("-->\n\na note\n"));
+        assert!(content.ends_with("---\n\na note\n"));
+        assert_eq!(content_id(&content).len(), 64);
     }
 }
