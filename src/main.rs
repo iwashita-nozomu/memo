@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-const VERSION: &str = "0.5.0";
+const VERSION: &str = "0.6.0";
 
 #[derive(Debug)]
 struct Config {
     repo: PathBuf,
     remote: Option<String>,
     environment: Option<String>,
+    metadata_script: Option<PathBuf>,
     auto_sync: bool,
 }
 
@@ -51,6 +52,10 @@ fn run() -> Result<(), String> {
         validate_repo(&config)?;
         println!("memo config: {}", config_path().display());
         println!("memo repo: {}", config.repo.display());
+        println!(
+            "metadata script: {}",
+            metadata_script_path(&config)?.display()
+        );
         return Ok(());
     }
     let mut tags = Vec::new();
@@ -78,11 +83,6 @@ fn run() -> Result<(), String> {
 
     let config = Config::load()?;
     validate_repo(&config)?;
-    let timestamp = command_text("date", &["+%Y-%m-%dT%H:%M:%S%:z"])?;
-    if !timestamp.contains('T') {
-        return Err(format!("date returned an invalid timestamp: {timestamp}"));
-    }
-    let environment = configured_environment(&config)?;
     let cwd = env::current_dir()
         .map_err(|error| format!("cannot resolve current directory: {error}"))?
         .canonicalize()
@@ -90,15 +90,8 @@ fn run() -> Result<(), String> {
     let message = args.join(" ");
     let tags = unique_tags(tags);
     let data_root = config.repo.join("memo");
-    let git_context = git_context(&cwd);
-    let content = format_entry(
-        &timestamp,
-        &environment,
-        &tags,
-        &cwd,
-        git_context.as_ref(),
-        &message,
-    );
+    let metadata = collect_metadata(&config, &cwd, &tags, &message)?;
+    let content = format_entry(&metadata, &message);
     let id = content_id(&content);
     let source = data_root.join("inbox").join(&id);
     let mirrors = tags
@@ -138,6 +131,7 @@ impl Config {
         let mut repo = None;
         let mut remote = None;
         let mut environment = None;
+        let mut metadata_script = None;
         let mut auto_sync = true;
         for (line_number, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -152,6 +146,7 @@ impl Config {
                 "repo" => repo = Some(expand_path(&value)?),
                 "remote" => remote = Some(value),
                 "environment" => environment = Some(value),
+                "metadata_script" => metadata_script = Some(expand_path(&value)?),
                 "auto_sync" => {
                     auto_sync = match value.as_str() {
                         "true" | "1" | "yes" => true,
@@ -176,6 +171,7 @@ impl Config {
             repo,
             remote,
             environment,
+            metadata_script,
             auto_sync,
         })
     }
@@ -248,36 +244,6 @@ fn validate_repo(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn configured_environment(config: &Config) -> Result<String, String> {
-    let raw = config
-        .environment
-        .clone()
-        .or_else(|| env::var("MEMO_ENVIRONMENT").ok())
-        .or_else(|| {
-            env::var("WSL_DISTRO_NAME")
-                .ok()
-                .map(|value| format!("wsl-{value}"))
-        })
-        .or_else(|| command_text("hostname", &["-s"]).ok())
-        .unwrap_or_else(|| "unknown-environment".to_string());
-    let slug = raw
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    Ok(if slug.is_empty() {
-        "unknown-environment".into()
-    } else {
-        slug
-    })
-}
-
 fn normalize_tag(raw: &str) -> Result<String, String> {
     let value = raw.trim().to_ascii_lowercase();
     if value.is_empty()
@@ -302,89 +268,66 @@ fn unique_tags(tags: Vec<String>) -> Vec<String> {
     unique
 }
 
-fn git_context(cwd: &Path) -> Option<Vec<(String, String)>> {
-    let root = command_text_in(cwd, "git", &["rev-parse", "--show-toplevel"])
-        .ok()?
-        .trim()
-        .to_string();
-    let branch = command_text_in(cwd, "git", &["branch", "--show-current"])
-        .ok()?
-        .trim()
-        .to_string();
-    let head = command_text_in(cwd, "git", &["rev-parse", "--short", "HEAD"])
-        .ok()?
-        .trim()
-        .to_string();
-    Some(vec![
-        ("git-root".into(), root),
-        (
-            "git-branch".into(),
-            if branch.is_empty() {
-                "detached".into()
-            } else {
-                branch
-            },
-        ),
-        ("git-head".into(), head),
-    ])
-}
-
-fn yaml_quote(value: &str) -> String {
-    let mut quoted = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            character => quoted.push(character),
-        }
-    }
-    quoted.push('"');
-    quoted
-}
-
 fn content_id(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn format_entry(
-    timestamp: &str,
-    environment: &str,
-    tags: &[String],
+fn metadata_script_path(config: &Config) -> Result<PathBuf, String> {
+    if let Some(path) = &config.metadata_script {
+        return Ok(path.clone());
+    }
+    if let Some(path) = env::var_os("MEMO_METADATA_SCRIPT") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set; configure metadata_script explicitly".to_string())?;
+    Ok(home.join(".local/lib/memo/metadata.sh"))
+}
+
+fn collect_metadata(
+    config: &Config,
     cwd: &Path,
-    git: Option<&Vec<(String, String)>>,
+    tags: &[String],
     message: &str,
-) -> String {
-    let mut content = format!(
-        "---\ntimestamp: {}\nenvironment: {}\ntags:",
-        yaml_quote(timestamp),
-        yaml_quote(environment),
-    );
-    if tags.is_empty() {
-        content.push_str(" []\n");
-    } else {
-        content.push('\n');
-        for tag in tags {
-            content.push_str(&format!("  - {}\n", yaml_quote(tag)));
-        }
+) -> Result<String, String> {
+    let script = metadata_script_path(config)?;
+    if !script.is_file() {
+        return Err(format!(
+            "metadata script is missing: {} (set metadata_script in config.toml or MEMO_METADATA_SCRIPT)",
+            script.display()
+        ));
     }
-    content.push_str(&format!("cwd: {}\n", yaml_quote(&cwd.to_string_lossy())));
-    if let Some(git) = git {
-        content.push_str("git:\n");
-        for (key, value) in git {
-            let key = key.strip_prefix("git-").unwrap_or(key);
-            content.push_str(&format!("  {key}: {}\n", yaml_quote(value)));
-        }
-    } else {
-        content.push_str("git: {}\n");
+    let mut command = Command::new(&script);
+    command
+        .current_dir(cwd)
+        .env("MEMO_TAGS", tags.join(","))
+        .env("MEMO_MESSAGE", message)
+        .env("MEMO_CWD", cwd);
+    if let Some(environment) = config.environment.as_deref() {
+        command.env("MEMO_ENVIRONMENT", environment);
     }
-    content.push_str("---\n\n");
-    content.push_str(message);
-    content.push('\n');
-    content
+    let output = command
+        .output()
+        .map_err(|error| format!("metadata script failed to start: {error}"))?;
+    if !output.status.success() {
+        return Err(command_failure("metadata script", &output));
+    }
+    let metadata = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if metadata.is_empty() {
+        return Err("metadata script returned no metadata".into());
+    }
+    if metadata.lines().any(|line| line.trim() == "---") {
+        return Err(
+            "metadata script must return YAML fields without front matter delimiters".into(),
+        );
+    }
+    Ok(metadata)
+}
+
+fn format_entry(metadata: &str, message: &str) -> String {
+    format!("---\n{metadata}\n---\n\n{message}\n")
 }
 
 fn write_entry(path: &Path, content: &str) -> Result<(), String> {
@@ -747,10 +690,6 @@ fn push(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {
     )
 }
 
-fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
-    command_output(Command::new(program).args(args))
-}
-
 fn command_text_in(dir: &Path, program: &str, args: &[&str]) -> Result<String, String> {
     command_output(Command::new(program).current_dir(dir).args(args))
 }
@@ -816,18 +755,8 @@ mod tests {
 
     #[test]
     fn entry_metadata_is_separated_from_the_body_with_frontmatter() {
-        let tags = vec!["todo".to_string()];
-        let git = vec![
-            ("git-root".to_string(), "/tmp/project".to_string()),
-            ("git-branch".to_string(), "main".to_string()),
-            ("git-head".to_string(), "abc1234".to_string()),
-        ];
         let content = format_entry(
-            "2026-08-22T10:30:00+09:00",
-            "gpu003",
-            &tags,
-            Path::new("/tmp/project"),
-            Some(&git),
+            "timestamp: \"2026-08-22T10:30:00+09:00\"\nenvironment: \"gpu003\"\ntags:\n  - \"todo\"\ncwd: \"/tmp/project\"\ngit:\n  root: \"/tmp/project\"\n  branch: \"main\"\n  head: \"abc1234\"",
             "a note",
         );
         assert!(content.starts_with("---\ntimestamp: \"2026-08-22T10:30:00+09:00\"\n"));

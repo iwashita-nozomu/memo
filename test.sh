@@ -31,7 +31,8 @@ printf '# memo test\n' > "$work/README.md"
 git -C "$work" add README.md
 git -C "$work" commit -m seed >/dev/null
 mkdir -p "$work/home/.config/memo"
-printf 'repo = "%s"\nenvironment = "test"\nauto_sync = false\n' "$work" > "$work/home/.config/memo/config.toml"
+printf 'repo = "%s"\nenvironment = "test"\nmetadata_script = "%s"\nauto_sync = false\n' \
+    "$work" "$repo_root/metadata.sh" > "$work/home/.config/memo/config.toml"
 
 output="$(
     HOME="$work/home" \
@@ -80,4 +81,27 @@ grep -Fq '  - "reference"' "$second_entry"
 ! grep -Fq 'second memo' "$entry"
 grep -Fq 'second memo' "$reference_mirror"
 grep -Fxq 'reference' "$work/home/.config/memo/tags"
-printf 'ok - Rust memo writes one immutable SHA file per note and mirrors tags\n'
+
+custom_script="$work/custom-metadata.sh"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf '\''custom: "yes"\nmessage_length: "%s"\n'\'' "${#MEMO_MESSAGE}"' \
+    > "$custom_script"
+chmod +x "$custom_script"
+custom_config="$work/home/.config/memo/custom.toml"
+printf 'repo = "%s"\nmetadata_script = "%s"\nauto_sync = false\n' \
+    "$work" "$custom_script" > "$custom_config"
+custom_output="$(
+    HOME="$work/home" \
+    MEMO_CONFIG="$custom_config" \
+    MEMO_AUTO_SYNC=0 \
+    RUSTUP_HOME="$rustup_home" \
+    CARGO_HOME="$cargo_home" \
+    RUSTUP_TOOLCHAIN="$rustup_toolchain" \
+    cargo run --quiet --manifest-path "$manifest" -- 'custom metadata'
+)"
+custom_entry="${custom_output#saved: }"
+test -f "$custom_entry"
+grep -Fq 'custom: "yes"' "$custom_entry"
+grep -Fq 'message_length: "15"' "$custom_entry"
+printf 'ok - Rust memo writes immutable SHA files, mirrors tags, and accepts custom metadata scripts\n'

@@ -17,11 +17,26 @@ managed by the integration that invokes this installer; create
 
     repo = "~/til"
     auto_sync = true
+    # metadata_script = "~/.config/memo/metadata.sh"
     # remote = "git@github.com:your-account/your-memo-repo.git"
     # environment = "gpu003-ubuntu2404"
 
 XDG_CONFIG_HOME is honored by the CLI. MEMO_CONFIG can select one config file
 for a test or a special environment.
+
+The installer places the default metadata collector at
+`~/.local/lib/memo/metadata.sh`. Set `metadata_script` to an executable script
+of your choice to replace it. The script runs from the memo command's current
+directory and must print YAML fields without the `---` front matter markers.
+The following context is provided as environment variables:
+
+    MEMO_TAGS       # comma-separated normalized tags
+    MEMO_MESSAGE    # complete memo body
+    MEMO_CWD        # canonical current directory
+    MEMO_ENVIRONMENT # configured environment override, when configured
+
+The script may emit any metadata fields, including fields specific to a user's
+machine or workflow. Its output becomes the front matter of the immutable note.
 
 ## Entries and tags
 
