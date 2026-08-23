@@ -626,60 +626,14 @@ fn sync_entry(
         "git",
         &["fetch".to_string(), remote.to_string()],
     )?;
-    rebase_with_auto_resolution(&config.repo, &format!("{remote}/{branch}"))?;
+    command_in(
+        &config.repo,
+        "git",
+        &["rebase".to_string(), format!("{remote}/{branch}")],
+    )?;
     push(&config.repo, remote, branch)?;
     eprintln!("memo: pushed {remote}/{branch} after fetch/rebase");
     Ok(())
-}
-
-fn rebase_with_auto_resolution(repo: &Path, upstream: &str) -> Result<(), String> {
-    let first_error = match command_in(repo, "git", &["rebase".to_string(), upstream.to_string()]) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    for _ in 0..10 {
-        let conflicts = command_text_in(repo, "git", &["diff", "--name-only", "--diff-filter=U"])?
-            .lines()
-            .map(str::to_string)
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>();
-        if conflicts.is_empty() {
-            if command_in(repo, "git", &["rebase".to_string(), "--skip".to_string()]).is_ok() {
-                return Ok(());
-            }
-            break;
-        }
-        for path in conflicts {
-            let side = "ours";
-            command_in(
-                repo,
-                "git",
-                &[
-                    "checkout".to_string(),
-                    side.to_string(),
-                    "--".to_string(),
-                    path.clone(),
-                ],
-            )?;
-            command_in(repo, "git", &["add".to_string(), "--".to_string(), path])?;
-        }
-        if command_in(
-            repo,
-            "git",
-            &[
-                "-c".to_string(),
-                "core.editor=true".to_string(),
-                "rebase".to_string(),
-                "--continue".to_string(),
-            ],
-        )
-        .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    let _ = command_in(repo, "git", &["rebase".to_string(), "--abort".to_string()]);
-    Err(format!("automatic rebase resolution failed: {first_error}"))
 }
 
 fn push(repo: &Path, remote: &str, branch: &str) -> Result<(), String> {
